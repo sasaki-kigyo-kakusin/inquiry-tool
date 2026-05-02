@@ -1,22 +1,6 @@
 # -*- coding: utf-8 -*-
-"""
-問い合わせ返信レコメンド Slack Bot
-------------------------------------
-使い方: ボットにDMを送るか、チャンネルで @ボット名 とメンションして
-        メール内容を貼り付けてください。
-
-メッセージ形式（すべて省略可）:
-  件名: チェックアウト時間について
-  送信者: yamada@example.com
-  施設: karuizawa        ← karuizawa / tryhaku / riveret
-  ---
-  (メール本文をここに貼り付け)
-
-  【補足】すでに分かっている情報があればここに追記
-          ↑ これはFAQデータベースに自動保存されます
-"""
-
-import os, re, json, requests, base64, datetime
+import os, re, json, requests, base64, datetime, threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 import anthropic
@@ -50,10 +34,6 @@ FACILITY_KEYWORDS = {
     "riveret":   ["リベレット", "riveret", "RIVERET"],
 }
 
-
-# ──────────────────────────────────────────
-# 共通ロジック（streamlit_app.py と同じ）
-# ──────────────────────────────────────────
 
 def load_faq():
     with open(FAQ_FILE, encoding="utf-8") as f:
@@ -183,7 +163,6 @@ def append_to_faq(facility_key, question, answer):
         )
         with open(FAQ_FILE, "a", encoding="utf-8") as f:
             f.write(entry)
-
         github_token = os.environ.get("GITHUB_TOKEN", "")
         github_repo  = os.environ.get("GITHUB_REPO", "sasaki-kigyo-kakusin/inquiry-tool")
         if github_token:
@@ -204,22 +183,13 @@ def append_to_faq(facility_key, question, answer):
         return False
 
 
-# ──────────────────────────────────────────
-# Slackメッセージのパース
-# ──────────────────────────────────────────
-
 def parse_slack_message(text):
-    """Slackメッセージから件名・送信者・施設・本文・補足を抽出する"""
-    # ボットメンション (<@UXXXXXXX>) を除去
     text = re.sub(r'<@[A-Z0-9]+>', '', text).strip()
-
     subject    = ""
     sender     = ""
     fac_manual = None
-
     lines = text.split('\n')
     body_start = 0
-
     for i, line in enumerate(lines):
         stripped = line.strip()
         if re.match(r'^件名[:：]', stripped):
@@ -234,65 +204,48 @@ def parse_slack_message(text):
         elif stripped == '---':
             body_start = i + 1
             break
-
     body_text = '\n'.join(lines[body_start:]).strip()
-
-    # 【補足】を抽出
     extra_info = ""
     if '【補足】' in body_text:
         parts      = body_text.split('【補足】', 1)
         body_text  = parts[0].strip()
         extra_info = parts[1].strip()
-
     return subject, sender, fac_manual, body_text, extra_info
 
 
 HELP_TEXT = (
     "*📬 問い合わせ返信レコメンドBOT の使い方*\n\n"
-    "メール内容をそのまま貼り付けるだけでOKです。\n"
-    "以下のヘッダーを先頭に追加すると精度が上がります（すべて省略可）:\n\n"
+    "メール内容をそのまま貼り付けるだけでOKです。\n\n"
     "```\n"
     "件名: チェックアウト時間について\n"
-    "送信者: yamada@example.com\n"
-    "施設: karuizawa\n"
     "---\n"
     "（メール本文をここに貼り付け）\n\n"
     "【補足】すでに分かっている情報（FAQに自動保存されます）\n"
     "```\n\n"
-    "*施設コード:*  `karuizawa` ／ `tryhaku` ／ `riveret`\n"
-    "`ヘルプ` または `help` と送ると、この説明を表示します。"
+    "*施設コード:*  `karuizawa` / `tryhaku` / `riveret`\n"
+    "`ヘルプ` と送るとこの説明を表示します。"
 )
 
-
-# ──────────────────────────────────────────
-# 問い合わせ処理
-# ──────────────────────────────────────────
 
 def process_inquiry(text, say, thread_ts=None):
     text = text.strip()
     if not text:
         say(text=HELP_TEXT, thread_ts=thread_ts)
         return
-
-    # ヘルプ
     if text.lower() in ("ヘルプ", "help", "使い方", "?", "？"):
         say(text=HELP_TEXT, thread_ts=thread_ts)
         return
 
     subject, sender, fac_manual, body, extra_info = parse_slack_message(text)
-
     if not body:
-        say(text="⚠️ メール本文が見つかりませんでした。`ヘルプ` と送ると使い方を確認できます。",
-            thread_ts=thread_ts)
+        say(text="⚠️ メール本文が見つかりませんでした。`ヘルプ` で使い方を確認できます。", thread_ts=thread_ts)
         return
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        say(text="⚠️ ANTHROPIC_API_KEY が未設定です。サーバー管理者に連絡してください。",
-            thread_ts=thread_ts)
+        say(text="⚠️ ANTHROPIC_API_KEY が未設定です。", thread_ts=thread_ts)
         return
 
-    # システムメール・予約通知チェック
     if is_system_email(subject, sender):
         say(text="ℹ️ システムメールと判定されました。対応不要です。", thread_ts=thread_ts)
         return
@@ -303,14 +256,11 @@ def process_inquiry(text, say, thread_ts=None):
     say(text="⏳ 分析中...", thread_ts=thread_ts)
 
     client = anthropic.Anthropic(api_key=api_key)
-
-    # 分類
     cl     = classify_email(subject, body, client)
     etype  = cl.get("type", "other")
     fkey   = cl.get("facility", "unknown")
     reason = cl.get("reason", "")
 
-    # 施設を手動指定で上書き
     if fac_manual and fac_manual in FACILITY_NAMES:
         fkey = fac_manual
     elif fkey == "unknown":
@@ -323,83 +273,77 @@ def process_inquiry(text, say, thread_ts=None):
         "system_notify":      "システムメール",
         "other":              "その他",
     }
-
     type_label = TYPE_LABELS.get(etype, etype)
     fac_label  = get_facility_name(fkey)
 
     if etype == "business_contact":
-        say(text=(
-            f"📋 *分類:* {type_label}　|　*施設:* {fac_label}\n"
-            "⚠️ 企業・業者からのコンタクトです。担当者が直接対応してください。"
-        ), thread_ts=thread_ts)
+        say(text=f"📋 *分類:* {type_label}　|　*施設:* {fac_label}\n⚠️ 企業・業者からのコンタクトです。担当者が直接対応してください。", thread_ts=thread_ts)
         return
     elif etype not in ("customer_inquiry",):
-        say(text=(
-            f"📋 *分類:* {type_label}　|　*施設:* {fac_label}\n"
-            "ℹ️ 対応不要のメールです。"
-        ), thread_ts=thread_ts)
+        say(text=f"📋 *分類:* {type_label}　|　*施設:* {fac_label}\nℹ️ 対応不要のメールです。", thread_ts=thread_ts)
         return
     elif fkey == "unknown":
-        say(text=(
-            f"📋 *分類:* {type_label}\n"
-            "⚠️ 施設を特定できませんでした。\n"
-            "メッセージの先頭に `施設: karuizawa`（または `tryhaku` / `riveret`）を追加して再送してください。"
-        ), thread_ts=thread_ts)
+        say(text=f"📋 *分類:* {type_label}\n⚠️ 施設を特定できませんでした。\nメッセージ先頭に `施設: karuizawa`（または `tryhaku` / `riveret`）を追加して再送してください。", thread_ts=thread_ts)
         return
 
-    # 返信生成
     faq_text  = load_faq()
     sysprompt = load_system_prompt()
     full_text = generate_response(subject, body, fkey, faq_text, sysprompt, client, extra_info)
     reply, todo = split_response(full_text)
 
-    # FAQ自動追記
     faq_added = False
     if extra_info.strip():
         q = subject.strip() if subject.strip() else body[:80]
         faq_added = append_to_faq(fkey, q, extra_info.strip())
 
-    # ヘッダー
     header = f"📋 *分類:* {type_label}　|　*施設:* {fac_label}"
     if reason:
         header += f"\n_判定理由: {reason}_"
     if faq_added:
         header += "\n✅ 補足情報をデータベースに追加しました。"
 
-    # 返信メール
     reply_block = f"*📧 返信メール案*\n```\n{reply}\n```"
-
-    # やるべきことリスト
-    todo_block = f"\n\n*✅ スタッフのやるべきことリスト*\n{todo}" if todo else ""
+    todo_block  = f"\n\n*✅ スタッフのやるべきことリスト*\n{todo}" if todo else ""
 
     say(text=header + "\n\n" + reply_block + todo_block, thread_ts=thread_ts)
 
 
-# ──────────────────────────────────────────
-# Slack イベントハンドラ
-# ──────────────────────────────────────────
-
+# ── Slack イベントハンドラ ──
 app = App(token=os.environ.get("SLACK_BOT_TOKEN", ""))
 
 
 @app.event("app_mention")
 def handle_mention(event, say):
-    """チャンネルで @ボット名 とメンションされたとき"""
     process_inquiry(event.get("text", ""), say, thread_ts=event.get("ts"))
 
 
 @app.event("message")
 def handle_dm(event, say):
-    """ダイレクトメッセージが来たとき（botのメッセージは無視）"""
     if event.get("channel_type") == "im" and not event.get("subtype"):
         process_inquiry(event.get("text", ""), say, thread_ts=event.get("ts"))
 
 
-# ──────────────────────────────────────────
-# 起動
-# ──────────────────────────────────────────
+# ── Render.com Web Service 用ヘルスチェックサーバー ──
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
 
 if __name__ == "__main__":
-    print("Slack Bot 起動中...")
+    # ヘルスチェックサーバーをバックグラウンドで起動
+    threading.Thread(target=start_health_server, daemon=True).start()
+    print("Health check server started.")
+    # Slack Bot 起動
+    print("Slack Bot starting...")
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
