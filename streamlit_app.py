@@ -228,10 +228,27 @@ with st.form("form"):
     subject    = st.text_input("件名（任意）")
     body       = st.text_area("本文 *", height=180)
     st.divider()
+
     st.markdown("**すでに分かっている情報（任意）**")
-    st.caption("入力した情報は返信に反映され、実行後botのデータベースに自動追加されます。")
+    st.caption("入力した情報は今回の返信に反映されます。")
     extra_info = st.text_area("", height=100, label_visibility="collapsed",
                               placeholder="例）BBQオプションは今月から受付停止。再開は未定。")
+
+    save_to_faq = st.checkbox(
+        "この情報をデータベースに追加する",
+        value=False,
+        help="チェックを入れると、次回以降の回答にも参照されるFAQデータベースに保存されます。"
+    )
+    if save_to_faq:
+        st.warning(
+            "⚠️ **データベースへの追加について**\n\n"
+            "追加した情報は次回以降、**全施設スタッフの回答に影響します。**\n\n"
+            "チェックを入れる前に以下を確認してください：\n"
+            "- 情報が正確であること\n"
+            "- どの施設の情報か明記されていること（例：「軽井沢ハウスヴィラのみ」「全施設共通」など）\n"
+            "- 状況によって変わる情報（時期限定など）はチェックしないこと"
+        )
+
     submit = st.form_submit_button("返信案を生成", type="primary", use_container_width=True)
 
 TYPE_LABELS = {
@@ -282,7 +299,7 @@ if submit:
             reply, todo = split_response(full_text)
 
             faq_added = False
-            if extra_info.strip():
+            if extra_info.strip() and save_to_faq:
                 q = subject.strip() if subject.strip() else body[:80]
                 faq_added = append_to_faq(fkey, q, extra_info.strip())
 
@@ -317,7 +334,7 @@ elif r["status"] == "ok":
     if r.get("reason"):
         st.caption("判定理由: " + r["reason"])
     if r.get("faq_added"):
-        st.success("データベースに自動追加しました。")
+        st.success("データベースに追加しました。")
 
     col_reply, col_todo = st.columns(2)
     with col_reply:
