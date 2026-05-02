@@ -1,0 +1,9 @@
+# 軽井沢ハウスヴィラ 問い合わせ返信ツール 必要ライブラリ
+# インストール: pip install -r requirements.txt
+
+anthropic>=0.40.0           # Claude API クライアント
+sentence-transformers>=3.0.0  # テキスト埋め込みモデル（日本語対応）
+faiss-cpu>=1.8.0             # ベクトル類似検索ライブラリ
+numpy>=1.24.0                # 数値計算
+openpyxl>=3.1.0              # Excelファイル読み込み（FAQ抽出スクリプト用）
+streamlit>=1.36.0            # Web UI（streamlit_app.py 用）
