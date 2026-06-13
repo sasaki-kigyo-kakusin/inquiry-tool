@@ -13,6 +13,7 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-6")
 FAQ_FILE     = os.path.join(os.path.dirname(__file__), "faq_manual.txt")
 PROMPT_FILE  = os.path.join(os.path.dirname(__file__), "chat_prompt.txt")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "history_log.jsonl")
+CANDIDATES_FILE = os.path.join(os.path.dirname(__file__), "faq_candidates.jsonl")
 
 GITHUB_REPO  = os.environ.get("GITHUB_REPO", "sasaki-kigyo-kakusin/inquiry-tool")
 SAVE_HISTORY_TO_GITHUB = os.environ.get("SAVE_HISTORY_TO_GITHUB", "0") == "1"
@@ -171,34 +172,75 @@ def generate_response(subject, body, facility_key, faq_text, system_prompt,
         + extra
         + lang_block + "\n"
         "[社内FAQ・マニュアル]\n" + faq_text + "\n\n"
-        "上記の情報をもとに、以下の2つを作成してください。\n\n"
+        "上記の情報をもとに、以下を作成してください。\n\n"
         "## お客様への返信メール\n"
         "件名と本文を作成してください。\n\n"
         "## スタッフのやるべきことリスト\n"
         "この問い合わせを受けてスタッフが取るべき具体的なアクションを番号付きリストで作成してください。"
         "FAQの【やるべきこと】欄を参考にしてください。\n\n"
-        "出力形式:\n"
+        "## 参照したFAQ\n"
+        "返信の根拠にした社内FAQの該当項目を【質問】見出しの形で箇条書きに。使っていなければ「なし」。\n\n"
+        "## FAQ未カバー\n"
+        "お客様の質問のうち社内FAQに情報が無く推測で答えられなかった点を箇条書きに。全て答えられたなら「なし」。\n\n"
+        "出力形式（この4見出しを必ず使うこと）:\n"
         "===返信メール===\n"
         "（件名と本文）\n\n"
         "===やるべきことリスト===\n"
-        "（番号付きアクション）\n"
+        "（番号付きアクション）\n\n"
+        "===参照したFAQ===\n"
+        "（箇条書き or なし）\n\n"
+        "===FAQ未カバー===\n"
+        "（箇条書き or なし）\n"
     )
-    res = client.messages.create(model=CLAUDE_MODEL, max_tokens=1500,
+    res = client.messages.create(model=CLAUDE_MODEL, max_tokens=1800,
                                  system=system_prompt,
                                  messages=[{"role": "user", "content": msg}])
     return res.content[0].text.strip()
 
 
 def split_response(text):
-    reply_part = ""
-    todo_part  = ""
-    if "===やるべきことリスト===" in text:
-        parts      = text.split("===やるべきことリスト===")
-        reply_part = parts[0].replace("===返信メール===", "").strip()
-        todo_part  = parts[1].strip() if len(parts) > 1 else ""
-    else:
-        reply_part = text
-    return reply_part, todo_part
+    markers = [
+        ("reply", "===返信メール==="),
+        ("todo", "===やるべきことリスト==="),
+        ("refs", "===参照したFAQ==="),
+        ("uncovered", "===FAQ未カバー==="),
+    ]
+    result = {"reply": "", "todo": "", "refs": "", "uncovered": ""}
+    present = [(k, mk, text.find(mk)) for k, mk in markers]
+    present = [(k, mk, p) for (k, mk, p) in present if p >= 0]
+    present.sort(key=lambda x: x[2])
+    if not present:
+        result["reply"] = text.strip()
+        return result
+    if present[0][2] > 0 and present[0][0] != "reply":
+        result["reply"] = text[:present[0][2]].strip()
+    for i, (k, mk, p) in enumerate(present):
+        start = p + len(mk)
+        end = present[i + 1][2] if i + 1 < len(present) else len(text)
+        result[k] = text[start:end].strip()
+    return result
+
+
+def _is_uncovered(text):
+    t = (text or "").strip().strip("　").lower()
+    return bool(t) and t not in ("なし", "無し", "特になし", "ありません", "なし。", "none", "-")
+
+
+def append_to_candidate(record):
+    try:
+        record = dict(record)
+        record.setdefault("ts", datetime.datetime.now().isoformat(timespec="seconds"))
+        with open(CANDIDATES_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if SAVE_HISTORY_TO_GITHUB:
+            cur = ""
+            if os.path.exists(CANDIDATES_FILE):
+                with open(CANDIDATES_FILE, encoding="utf-8") as f:
+                    cur = f.read()
+            github_put_file("faq_candidates.jsonl", cur, "faq候補: " + record.get("ts", ""))
+        return True
+    except Exception:
+        return False
 
 
 def append_to_faq(facility_key, question, answer):
@@ -359,12 +401,23 @@ def process_inquiry(text, say, thread_ts=None):
     sysprompt = load_system_prompt()
     full_text = generate_response(subject, body, fkey, faq_text, sysprompt,
                                   client, extra_info, lang)
-    reply, todo = split_response(full_text)
+    sec = split_response(full_text)
+    reply, todo = sec["reply"], sec["todo"]
+    refs, uncovered = sec["refs"], sec["uncovered"]
 
     faq_added = False
     if extra_info.strip() and save_db:
         q = subject.strip() if subject.strip() else body[:80]
         faq_added = append_to_faq(fkey, q, extra_info.strip())
+
+    candidate_logged = False
+    if _is_uncovered(uncovered):
+        candidate_logged = append_to_candidate({
+            "facility": fkey,
+            "subject":  subject.strip(),
+            "body":     body.strip()[:500],
+            "uncovered": uncovered,
+        })
 
     # 対応履歴へ記録
     append_to_history({
@@ -376,6 +429,8 @@ def process_inquiry(text, say, thread_ts=None):
         "body":     body.strip()[:500],
         "reply":    reply,
         "todo":     todo,
+        "refs":     refs,
+        "uncovered": uncovered,
         "faq_added": faq_added,
     })
 
@@ -387,8 +442,16 @@ def process_inquiry(text, say, thread_ts=None):
 
     reply_block = f"*📧 返信メール案*\n```\n{reply}\n```"
     todo_block  = f"\n\n*✅ スタッフのやるべきことリスト*\n{todo}" if todo else ""
+    refs_block  = f"\n\n*📎 参照したFAQ*\n{refs}" if refs and refs.strip() not in ("なし", "") else ""
+    warn_block  = ""
+    if _is_uncovered(uncovered):
+        warn_block = ("\n\n⚠️ *FAQに無い内容が含まれています（推測では回答していません）*\n"
+                      + uncovered)
+        if candidate_logged:
+            warn_block += "\n→ FAQ追加候補に記録しました。"
 
-    say(text=header + "\n\n" + reply_block + todo_block, thread_ts=thread_ts)
+    say(text=header + "\n\n" + reply_block + todo_block + refs_block + warn_block,
+        thread_ts=thread_ts)
 
 
 # ── Slack イベントハンドラ ──

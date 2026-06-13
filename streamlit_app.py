@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os, re, json, base64, datetime, requests
 import streamlit as st
+import streamlit.components.v1 as components
 import anthropic
 
 # ============================================================
@@ -14,6 +15,7 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-6")
 FAQ_FILE     = os.path.join(os.path.dirname(__file__), "faq_manual.txt")
 PROMPT_FILE  = os.path.join(os.path.dirname(__file__), "chat_prompt.txt")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "history_log.jsonl")
+CANDIDATES_FILE = os.path.join(os.path.dirname(__file__), "faq_candidates.jsonl")
 
 GITHUB_REPO  = os.environ.get("GITHUB_REPO", "sasaki-kigyo-kakusin/inquiry-tool")
 # 履歴を毎回GitHubへコミットすると都度デプロイが走る可能性があるため、
@@ -343,34 +345,108 @@ def generate_response(subject, body, facility_key, faq_text, system_prompt,
         + extra
         + lang_block + "\n"
         "[社内FAQ・マニュアル]\n" + faq_text + "\n\n"
-        "上記の情報をもとに、以下の2つを作成してください。\n\n"
+        "上記の情報をもとに、以下を作成してください。\n\n"
         "## お客様への返信メール\n"
         "件名と本文を作成してください。\n\n"
         "## スタッフのやるべきことリスト\n"
         "この問い合わせを受けてスタッフが取るべき具体的なアクションを番号付きリストで作成してください。"
         "FAQの【やるべきこと】欄を参考にしてください。\n\n"
-        "出力形式:\n"
+        "## 参照したFAQ\n"
+        "返信の根拠にした社内FAQの該当項目を、【質問】見出しの形で箇条書きにしてください。"
+        "FAQを使っていなければ「なし」と書いてください。\n\n"
+        "## FAQ未カバー\n"
+        "お客様の質問のうち、社内FAQに情報が無く推測で答えられなかった点を箇条書きにしてください。"
+        "全てFAQで答えられたなら「なし」と書いてください。\n\n"
+        "出力形式（この4見出しを必ず使うこと）:\n"
         "===返信メール===\n"
         "（件名と本文）\n\n"
         "===やるべきことリスト===\n"
-        "（番号付きアクション）\n"
+        "（番号付きアクション）\n\n"
+        "===参照したFAQ===\n"
+        "（箇条書き or なし）\n\n"
+        "===FAQ未カバー===\n"
+        "（箇条書き or なし）\n"
     )
-    res = client.messages.create(model=CLAUDE_MODEL, max_tokens=1500,
+    res = client.messages.create(model=CLAUDE_MODEL, max_tokens=1800,
                                  system=system_prompt,
                                  messages=[{"role": "user", "content": msg}])
     return res.content[0].text.strip()
 
 
 def split_response(text):
-    reply_part = ""
-    todo_part  = ""
-    if "===やるべきことリスト===" in text:
-        parts      = text.split("===やるべきことリスト===")
-        reply_part = parts[0].replace("===返信メール===", "").strip()
-        todo_part  = parts[1].strip() if len(parts) > 1 else ""
-    else:
-        reply_part = text
-    return reply_part, todo_part
+    """4セクション（返信／やること／参照FAQ／未カバー）をdictで返す。
+    見出しが欠けても壊れないようにする。"""
+    markers = [
+        ("reply", "===返信メール==="),
+        ("todo", "===やるべきことリスト==="),
+        ("refs", "===参照したFAQ==="),
+        ("uncovered", "===FAQ未カバー==="),
+    ]
+    result = {"reply": "", "todo": "", "refs": "", "uncovered": ""}
+    present = [(k, mk, text.find(mk)) for k, mk in markers]
+    present = [(k, mk, p) for (k, mk, p) in present if p >= 0]
+    present.sort(key=lambda x: x[2])
+    if not present:
+        result["reply"] = text.strip()
+        return result
+    # 最初の見出しより前にテキストがあれば返信扱い
+    if present[0][2] > 0 and present[0][0] != "reply":
+        result["reply"] = text[:present[0][2]].strip()
+    for i, (k, mk, p) in enumerate(present):
+        start = p + len(mk)
+        end = present[i + 1][2] if i + 1 < len(present) else len(text)
+        result[k] = text[start:end].strip()
+    return result
+
+
+def _is_uncovered(text):
+    t = (text or "").strip().strip("　").lower()
+    return bool(t) and t not in ("なし", "無し", "特になし", "ありません", "なし。", "none", "-")
+
+
+def append_to_candidate(record):
+    """FAQ未カバーの問い合わせを追加候補として記録。"""
+    try:
+        record = dict(record)
+        record.setdefault("ts", datetime.datetime.now().isoformat(timespec="seconds"))
+        with open(CANDIDATES_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if SAVE_HISTORY_TO_GITHUB:
+            cur = ""
+            if os.path.exists(CANDIDATES_FILE):
+                with open(CANDIDATES_FILE, encoding="utf-8") as f:
+                    cur = f.read()
+            github_put_file("faq_candidates.jsonl", cur, "faq候補: " + record.get("ts", ""))
+        return True
+    except Exception:
+        return False
+
+
+def load_candidates():
+    if not os.path.exists(CANDIDATES_FILE):
+        return []
+    rows = []
+    with open(CANDIDATES_FILE, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    rows.reverse()
+    return rows
+
+
+def clear_candidates():
+    try:
+        open(CANDIDATES_FILE, "w", encoding="utf-8").close()
+        if SAVE_HISTORY_TO_GITHUB:
+            github_put_file("faq_candidates.jsonl", "", "faq候補クリア")
+        return True
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -541,6 +617,160 @@ def aco_tmpl_confirmed(name, tou, ci_date, nights, adults, kids, pet, options):
 
 
 # ============================================================
+# オプション料金（3施設）
+# ============================================================
+# 各項目: (キー, 表示名, 単位, 公式料金, OTA料金)  ※OTAが無い施設は同額
+OPTION_PRICES = {
+    "karuizawa": {
+        "has_ota": True,
+        "items": [
+            ("early",  "アーリーチェックイン", "時間", 4400, 4400),
+            ("late",   "レイトチェックアウト", "時間", 4400, 4400),
+            ("pet",    "ペット同伴",           "泊",  9000, 9000),
+            ("bbq",    "BBQ機材レンタル",       "台",  3850, 4400),
+            ("fire",   "焚き火台",             "台",  2750, 3300),
+            ("sauna",  "サウナ（サウナ棟・B棟のみ）", "泊", 10000, 12000),
+            ("people", "人数変更",             "人",  7700, 8800),
+        ],
+    },
+    "riveret": {
+        "has_ota": False,
+        "items": [
+            ("bbq",        "BBQセット（炭・トング込み）", "滞在", 5000, 5000),
+            ("maki_set",   "薪暖炉 薪セット（7〜10本）", "回",  2000, 2000),
+            ("maki_extra", "薪 追加",                   "本",   100,  100),
+            ("maki_free",  "薪 使い放題",               "滞在", 4000, 4000),
+            ("sauna_d1",   "サウナ 初日",               "人",  1500, 1500),
+            ("sauna_dn",   "サウナ 2日目以降",          "人日", 2000, 2000),
+        ],
+    },
+    "tryhaku": {
+        "has_ota": False,
+        # ※BBQ・焚き火・薪ストーブ・愛犬の金額は社内資料に未記載のため0（要確認）。
+        #   正しい金額が分かったらここを更新してください。
+        "items": [
+            ("people", "人数変更（増減）",        "人", 8800, 8800),
+            ("pet",    "愛犬オプション（要確認）", "頭",    0,    0),
+            ("bbq",    "BBQ・夏季（要確認）",      "台",    0,    0),
+            ("fire",   "焚き火（要確認）",         "回",    0,    0),
+            ("stove",  "薪ストーブ（要確認）",     "回",    0,    0),
+        ],
+    },
+}
+
+
+# ============================================================
+# 締切（オプション・変更）
+# ============================================================
+def deadline_info(facility_key, stay_date):
+    """宿泊日から施設別の締切を算出。返り値: [(項目, 期日文字列)]。"""
+    d = stay_date
+    out = []
+    if facility_key == "karuizawa":
+        prev = d - datetime.timedelta(days=1)
+        d4   = d - datetime.timedelta(days=4)
+        out.append(("オプション・人数変更の受付＆支払い", jp_date(prev) + " 17:00まで"))
+        out.append(("BBQ等オプションのキャンセル",       jp_date(prev) + " 17:00まで"))
+        out.append(("薪ストーブの申し込み（原則）",       jp_date(d4) + "まで"))
+    elif facility_key == "riveret":
+        d2 = d - datetime.timedelta(days=2)
+        out.append(("オプション申し込み（支払い完了まで）", jp_date(d2) + "まで"))
+        out.append(("サウナ申し込み",                     jp_date(d2) + "まで"))
+    elif facility_key == "tryhaku":
+        d7 = d - datetime.timedelta(days=7)
+        d3 = d - datetime.timedelta(days=3)
+        d14 = d - datetime.timedelta(days=14)
+        out.append(("BBQ・焚き火・薪ストーブの注文",     jp_date(d7) + "まで"))
+        out.append(("オプションの支払い",                 jp_date(d3) + "まで"))
+        out.append(("BBQ等オプションのキャンセル料発生", jp_date(d14) + "から"))
+    return out
+
+
+# ============================================================
+# PayPay / 振込
+# ============================================================
+PAYPAY_QR_FILES = {
+    "A棟":   "paypay_A.png",
+    "B棟":   "paypay_B.png",
+    "別邸":  "paypay_bettei.png",
+}
+
+
+def find_qr_path(tou):
+    """棟に対応するQR画像のパスを返す。別邸が無ければA棟で代用。無ければNone。"""
+    fname = PAYPAY_QR_FILES.get(tou)
+    if fname:
+        p = os.path.join(os.path.dirname(__file__), fname)
+        if os.path.exists(p):
+            return p
+    if tou == "別邸":  # 別邸はA棟QRで代用可
+        pa = os.path.join(os.path.dirname(__file__), PAYPAY_QR_FILES["A棟"])
+        if os.path.exists(pa):
+            return pa
+    return None
+
+
+def file_b64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
+
+
+def image_copy_button(b64, mime="image/png"):
+    """画像をクリップボードにコピーするボタン（HTTPS環境で動作）。"""
+    html = (
+        '<button id="cpb" style="padding:8px 16px;border:0;border-radius:6px;'
+        'background:#ff4b4b;color:#fff;font-size:14px;cursor:pointer;">'
+        '📋 画像をクリップボードにコピー</button>'
+        '<span id="cpm" style="margin-left:10px;font-size:13px;"></span>'
+        '<script>'
+        'const _d="data:' + mime + ';base64,' + b64 + '";'
+        'document.getElementById("cpb").onclick=async()=>{'
+        'try{const r=await fetch(_d);const b=await r.blob();'
+        'await navigator.clipboard.write([new ClipboardItem({[b.type]:b})]);'
+        'document.getElementById("cpm").innerText="コピーしました。メールに貼り付けできます。";}'
+        'catch(e){document.getElementById("cpm").innerText="コピー不可: "+e+"（下のダウンロードをご利用ください）";}'
+        '};'
+        '</script>'
+    )
+    components.html(html, height=48)
+
+
+def paypay_message(tou, option_name, amount, deadline_str):
+    bettei_note = ""
+    if tou == "別邸":
+        bettei_note = ('※PayPayでお支払い後は"A棟"と表示されますが、'
+                       'ご予約は別邸でお間違いございません。\n')
+    amt = f"{int(amount):,}円" if amount else "〇円"
+    return (
+        "軽井沢ハウスヴィラです。\n"
+        "ご連絡ありがとうございます。\n"
+        f"{option_name}【{amt}】につきまして、添付のPayPay QRコードにて"
+        "お手続きいただければと存じます。\n"
+        "※現地決済は不可となります。お支払い完了後はメールでご連絡ください。\n"
+        + bettei_note +
+        "【お支払い金額】\n"
+        f"{amt}\n"
+        "【お支払い期日】\n"
+        f"{deadline_str}\n"
+        "何卒、よろしくお願いいたします。\n"
+        "軽井沢ハウスヴィラ"
+    )
+
+
+def furikomi_message(amount, deadline_str):
+    amt = f"{int(amount):,}円" if amount else "〇円"
+    return (
+        "下記に振込口座先を記載しておりますので期日までにお振込をお願い致します。\n"
+        + ACO_BANK + "\n"
+        "【金額】\n"
+        f"{amt}\n"
+        "※お振込手数料はご負担いただきますようお願いいたします。\n"
+        "【お支払い期日】\n"
+        f"{deadline_str}まで"
+    )
+
+
+# ============================================================
 # UI
 # ============================================================
 st.set_page_config(page_title="問い合わせ返信レコメンド", layout="wide")
@@ -579,8 +809,9 @@ with st.sidebar:
     with st.expander("システムプロンプト"):
         st.code(load_system_prompt(), language="markdown")
 
-tab_gen, tab_aco, tab_hist, tab_faq = st.tabs(
-    ["📧 返信生成", "💰 ACO見積", "🗂 対応履歴", "📚 FAQ管理"])
+tab_gen, tab_aco, tab_calc, tab_pay, tab_hist, tab_faq = st.tabs(
+    ["📧 返信生成", "💰 ACO見積", "🧮 料金・期限", "💳 PayPay・振込",
+     "🗂 対応履歴", "📚 FAQ管理"])
 
 
 # ------------------------------------------------------------
@@ -659,12 +890,24 @@ with tab_gen:
                     full_text = generate_response(subject, body, fkey, faq_text,
                                                   sysprompt, client, extra_info, lang)
 
-                reply, todo = split_response(full_text)
+                sec = split_response(full_text)
+                reply, todo = sec["reply"], sec["todo"]
+                refs, uncovered = sec["refs"], sec["uncovered"]
 
                 faq_added = False
                 if extra_info.strip() and save_to_faq:
                     q = subject.strip() if subject.strip() else body[:80]
                     faq_added = append_to_faq(fkey, q, extra_info.strip())
+
+                # FAQ未カバーなら追加候補として記録
+                candidate_logged = False
+                if _is_uncovered(uncovered):
+                    candidate_logged = append_to_candidate({
+                        "facility": fkey,
+                        "subject":  subject.strip(),
+                        "body":     body.strip()[:500],
+                        "uncovered": uncovered,
+                    })
 
                 # 対応履歴へ記録
                 append_to_history({
@@ -676,12 +919,16 @@ with tab_gen:
                     "body":     body.strip()[:500],
                     "reply":    reply,
                     "todo":     todo,
+                    "refs":     refs,
+                    "uncovered": uncovered,
                     "faq_added": faq_added,
                 })
 
                 st.session_state.result = {
                     "status": "ok", "etype": etype, "fkey": fkey, "reason": reason,
-                    "language": lang, "reply": reply, "todo": todo, "faq_added": faq_added,
+                    "language": lang, "reply": reply, "todo": todo,
+                    "refs": refs, "uncovered": uncovered,
+                    "faq_added": faq_added, "candidate_logged": candidate_logged,
                 }
 
     r = st.session_state.result
@@ -723,6 +970,19 @@ with tab_gen:
                 st.text_area("", value=r["todo"], height=400, label_visibility="collapsed")
             else:
                 st.info("やるべきことは特にありません。")
+
+        # FAQ未カバーの警告
+        if _is_uncovered(r.get("uncovered", "")):
+            msg = ("⚠️ **FAQに無い内容が含まれています（推測では回答していません）**\n\n"
+                   + r.get("uncovered", ""))
+            if r.get("candidate_logged"):
+                msg += "\n\n→ この問い合わせを「FAQ追加候補」に記録しました（対応履歴タブで確認）。"
+            st.warning(msg)
+
+        # 参照したFAQ（出典）
+        refs = r.get("refs", "")
+        with st.expander("📎 参照したFAQ（根拠の確認用）"):
+            st.markdown(refs if refs else "（記載なし）")
 
 
 # ------------------------------------------------------------
@@ -789,6 +1049,27 @@ with tab_hist:
                 if rec.get("todo"):
                     st.markdown("**やるべきこと**")
                     st.text(rec.get("todo", ""))
+
+    st.divider()
+    st.subheader("📝 FAQ追加候補（FAQで答えられなかった質問）")
+    cands = load_candidates()
+    if not cands:
+        st.info("追加候補はありません。FAQに無い質問が来ると、ここに自動でたまります。")
+    else:
+        st.caption(f"{len(cands)} 件。FAQ化したら「クリア」で消せます。")
+        for c in cands:
+            ttl = (c.get("ts", "")[:16] + " | "
+                   + get_facility_name(c.get("facility", "")) + " | "
+                   + (c.get("subject", "") or c.get("body", "")[:30]))
+            with st.expander(ttl):
+                if c.get("body"):
+                    st.markdown("**問い合わせ本文**")
+                    st.text(c.get("body", ""))
+                st.markdown("**FAQに無かった点**")
+                st.text(c.get("uncovered", ""))
+        if st.button("追加候補をすべてクリア"):
+            clear_candidates()
+            st.rerun()
 
 
 # ------------------------------------------------------------
@@ -925,3 +1206,94 @@ with tab_aco:
 
     st.markdown("**コピー用テキスト**")
     st.text_area("", value=text, height=420, label_visibility="collapsed")
+
+
+# ------------------------------------------------------------
+# タブ: 料金・期限
+# ------------------------------------------------------------
+with tab_calc:
+    st.subheader("オプション料金の計算")
+    cf1, cf2 = st.columns([1, 1])
+    calc_fac_label = cf1.selectbox("施設", list(FACILITY_NAMES.values()),
+                                   key="calc_fac")
+    calc_fkey = [k for k, v in FACILITY_NAMES.items() if v == calc_fac_label][0]
+    cfg = OPTION_PRICES[calc_fkey]
+
+    route = "公式"
+    if cfg["has_ota"]:
+        route = cf2.radio("予約経路", ["公式", "OTA"], horizontal=True, key="calc_route")
+    else:
+        cf2.caption("この施設は公式/OTAで料金差はありません。")
+
+    total = 0
+    for key, label, unit, off, ota in cfg["items"]:
+        price = ota if (route == "OTA" and cfg["has_ota"]) else off
+        c1, c2, c3 = st.columns([3, 1, 2])
+        c1.markdown(f"**{label}**" + (f"　({price:,}円/{unit})" if price else f"　(金額未設定/{unit})"))
+        qty = c2.number_input(f"数量({unit})", min_value=0, step=1, value=0,
+                              key=f"opt_{calc_fkey}_{key}", label_visibility="collapsed")
+        sub = price * qty
+        total += sub
+        c3.markdown(f"小計： **{sub:,}円**")
+
+    st.divider()
+    st.metric("オプション合計", f"{total:,}円")
+    if calc_fkey == "tryhaku":
+        st.caption("※「要確認」の項目は社内資料に金額の記載がないため0円です。正しい金額は"
+                   "コード内 OPTION_PRICES の tryhaku を更新してください。")
+
+    st.divider()
+    st.subheader("オプション・変更の締切チェッカー")
+    dc1, dc2 = st.columns([1, 1])
+    dl_fac_label = dc1.selectbox("施設", list(FACILITY_NAMES.values()), key="dl_fac")
+    dl_fkey = [k for k, v in FACILITY_NAMES.items() if v == dl_fac_label][0]
+    stay = dc2.date_input("宿泊日（チェックイン日）", value=datetime.date.today(),
+                          key="dl_stay")
+    st.markdown(f"**{dl_fac_label}** の締切：")
+    for label, when in deadline_info(dl_fkey, stay):
+        st.markdown(f"- {label}： **{when}**")
+
+
+# ------------------------------------------------------------
+# タブ: PayPay・振込
+# ------------------------------------------------------------
+with tab_pay:
+    st.subheader("PayPay・振込 クイック案内")
+    st.caption("棟を選ぶとPayPay QRと案内文が出ます。金額・期日を入れて文面をコピー、QRは"
+               "「コピー」ボタンでそのままメールに貼り付けできます。")
+
+    p1, p2, p3 = st.columns(3)
+    tou = p1.selectbox("棟（PayPay QR）", ["A棟", "B棟", "別邸"])
+    opt_name = p2.text_input("項目名", value="ペットプラン",
+                             help="例）ペットプラン、サウナ、人数追加 など")
+    pay_amount = p3.number_input("金額（円）", min_value=0, step=1000, value=0)
+    pay_deadline = st.date_input("お支払い期日",
+                                 value=datetime.date.today() + datetime.timedelta(days=7))
+    deadline_str = jp_date(pay_deadline)
+
+    method = st.radio("支払い方法", ["PayPay", "銀行振込"], horizontal=True)
+
+    if method == "PayPay":
+        st.markdown("#### QRコード")
+        qr_path = find_qr_path(tou)
+        if qr_path:
+            ic1, ic2 = st.columns([1, 2])
+            with ic1:
+                st.image(qr_path, width=220)
+            with ic2:
+                b64 = file_b64(qr_path)
+                image_copy_button(b64)
+                st.download_button("QR画像をダウンロード", data=open(qr_path, "rb").read(),
+                                   file_name=os.path.basename(qr_path), mime="image/png")
+                if tou == "別邸" and os.path.basename(qr_path) == PAYPAY_QR_FILES["A棟"]:
+                    st.caption("※別邸用QRが未登録のためA棟QRを表示中（内容は同じ）。")
+        else:
+            st.warning(f"QR画像が見つかりません。`{PAYPAY_QR_FILES.get(tou, '')}` を"
+                       "このフォルダに置いてください。")
+        st.markdown("#### 案内文（コピー用）")
+        st.text_area("", value=paypay_message(tou, opt_name, pay_amount, deadline_str),
+                     height=300, label_visibility="collapsed")
+    else:
+        st.markdown("#### 振込案内（コピー用）")
+        st.text_area("", value=furikomi_message(pay_amount, deadline_str),
+                     height=320, label_visibility="collapsed")
