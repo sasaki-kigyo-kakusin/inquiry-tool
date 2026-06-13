@@ -689,25 +689,25 @@ def deadline_info(facility_key, stay_date):
 # ============================================================
 # PayPay / 振込
 # ============================================================
-PAYPAY_QR_FILES = {
-    "A棟":   "paypay_A.png",
-    "B棟":   "paypay_B.png",
-    "別邸":  "paypay_bettei.png",
-}
+QR_DIR = os.path.join(os.path.dirname(__file__), "qr")
 
 
-def find_qr_path(tou):
-    """棟に対応するQR画像のパスを返す。別邸が無ければA棟で代用。無ければNone。"""
-    fname = PAYPAY_QR_FILES.get(tou)
-    if fname:
-        p = os.path.join(os.path.dirname(__file__), fname)
-        if os.path.exists(p):
-            return p
-    if tou == "別邸":  # 別邸はA棟QRで代用可
-        pa = os.path.join(os.path.dirname(__file__), PAYPAY_QR_FILES["A棟"])
-        if os.path.exists(pa):
-            return pa
-    return None
+def list_qr_images():
+    """QR画像のパス一覧。qr/ フォルダがあればそこ、無ければ本体と同じフォルダの画像。
+    ファイル名は自由（QRに棟名が入っている前提で、見て選ぶ）。"""
+    base = QR_DIR if os.path.isdir(QR_DIR) else os.path.dirname(__file__)
+    out = []
+    try:
+        for fn in sorted(os.listdir(base)):
+            if fn.lower().endswith((".png", ".jpg", ".jpeg")):
+                out.append(os.path.join(base, fn))
+    except Exception:
+        pass
+    return out
+
+
+def img_mime(path):
+    return "image/jpeg" if path.lower().endswith((".jpg", ".jpeg")) else "image/png"
 
 
 def file_b64(path):
@@ -1259,11 +1259,11 @@ with tab_calc:
 # ------------------------------------------------------------
 with tab_pay:
     st.subheader("PayPay・振込 クイック案内")
-    st.caption("棟を選ぶとPayPay QRと案内文が出ます。金額・期日を入れて文面をコピー、QRは"
-               "「コピー」ボタンでそのままメールに貼り付けできます。")
+    st.caption("金額・期日を入れて案内文をコピー。QRは下に全棟分を表示するので、"
+               "送りたい棟のQRを「コピー」または「ダウンロード」でメールに貼り付けてください。")
 
     p1, p2, p3 = st.columns(3)
-    tou = p1.selectbox("棟（PayPay QR）", ["A棟", "B棟", "別邸"])
+    tou = p1.selectbox("棟（案内文の注記用）", ["A棟", "B棟", "別邸"])
     opt_name = p2.text_input("項目名", value="ペットプラン",
                              help="例）ペットプラン、サウナ、人数追加 など")
     pay_amount = p3.number_input("金額（円）", min_value=0, step=1000, value=0)
@@ -1274,25 +1274,27 @@ with tab_pay:
     method = st.radio("支払い方法", ["PayPay", "銀行振込"], horizontal=True)
 
     if method == "PayPay":
-        st.markdown("#### QRコード")
-        qr_path = find_qr_path(tou)
-        if qr_path:
-            ic1, ic2 = st.columns([1, 2])
-            with ic1:
-                st.image(qr_path, width=220)
-            with ic2:
-                b64 = file_b64(qr_path)
-                image_copy_button(b64)
-                st.download_button("QR画像をダウンロード", data=open(qr_path, "rb").read(),
-                                   file_name=os.path.basename(qr_path), mime="image/png")
-                if tou == "別邸" and os.path.basename(qr_path) == PAYPAY_QR_FILES["A棟"]:
-                    st.caption("※別邸用QRが未登録のためA棟QRを表示中（内容は同じ）。")
-        else:
-            st.warning(f"QR画像が見つかりません。`{PAYPAY_QR_FILES.get(tou, '')}` を"
-                       "このフォルダに置いてください。")
         st.markdown("#### 案内文（コピー用）")
+        if tou == "別邸":
+            st.caption('別邸はA棟のQRで支払い後 "A棟" と表示されます（案内文に注記済み）。')
         st.text_area("", value=paypay_message(tou, opt_name, pay_amount, deadline_str),
                      height=300, label_visibility="collapsed")
+
+        st.markdown("#### QRコード（棟名はQR画像に記載）")
+        qrs = list_qr_images()
+        if not qrs:
+            st.warning("QR画像が見つかりません。お問い合わせbotフォルダ（または中に作った "
+                       "`qr` フォルダ）にQR画像（png/jpg）を置いてください。ファイル名は自由です。")
+        else:
+            ncol = min(3, len(qrs))
+            cols = st.columns(ncol)
+            for i, p in enumerate(qrs):
+                with cols[i % ncol]:
+                    st.image(p, caption=os.path.basename(p), width=210)
+                    image_copy_button(file_b64(p), mime=img_mime(p))
+                    st.download_button("ダウンロード", data=open(p, "rb").read(),
+                                       file_name=os.path.basename(p), mime=img_mime(p),
+                                       key=f"qrdl_{i}")
     else:
         st.markdown("#### 振込案内（コピー用）")
         st.text_area("", value=furikomi_message(pay_amount, deadline_str),
