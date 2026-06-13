@@ -691,19 +691,17 @@ def deadline_info(facility_key, stay_date):
 # ============================================================
 QR_DIR = os.path.join(os.path.dirname(__file__), "qr")
 
-# 棟 → QR画像ファイル名（ファイル名はそのままでOK）
-PAYPAY_QR_FILES = {
-    "A棟":  "スクリーンショット 2026-05-02 112929.png",
-    "B棟":  "スクリーンショット 2026-05-02 112947.png",
-    "別邸": "スクリーンショット 2026-05-02 112905.png",
-}
+# 表示順（ラベル, QR画像ファイル名）。ファイル名はそのままでOK。
+PAYPAY_QR = [
+    ("A棟",        "スクリーンショット 2026-05-02 112929.png"),
+    ("B棟",        "スクリーンショット 2026-05-02 112905.png"),
+    ("別邸",       "スクリーンショット 2026-05-02 112947.png"),
+    ("リベレット", "スクリーンショット 2026-04-26 140431.png"),
+]
 
 
-def qr_path_for(tou):
-    """棟に対応するQR画像のパスを返す。qr/ フォルダ→本体フォルダの順で探す。無ければNone。"""
-    fname = PAYPAY_QR_FILES.get(tou)
-    if not fname:
-        return None
+def qr_path(fname):
+    """QR画像のパスを返す。qr/ フォルダ→本体フォルダの順で探す。無ければNone。"""
     for base in (QR_DIR, os.path.dirname(__file__)):
         p = os.path.join(base, fname)
         if os.path.exists(p):
@@ -740,39 +738,40 @@ def image_copy_button(b64, mime="image/png"):
     components.html(html, height=48)
 
 
-def paypay_message(tou, option_name, amount, deadline_str):
+def payment_message(tou, option_name, amount, deadline_str, furikomi_ok):
+    """PayPay＋（条件を満たせば）振込をまとめた1通の案内文。"""
+    amt = f"{int(amount):,}円" if amount else "〇円"
     bettei_note = ""
     if tou == "別邸":
         bettei_note = ('※PayPayでお支払い後は"A棟"と表示されますが、'
                        'ご予約は別邸でお間違いございません。\n')
-    amt = f"{int(amount):,}円" if amount else "〇円"
-    return (
+    msg = (
         "軽井沢ハウスヴィラです。\n"
         "ご連絡ありがとうございます。\n"
-        f"{option_name}【{amt}】につきまして、添付のPayPay QRコードにて"
-        "お手続きいただければと存じます。\n"
-        "※現地決済は不可となります。お支払い完了後はメールでご連絡ください。\n"
-        + bettei_note +
-        "【お支払い金額】\n"
+        f"{option_name}【{amt}】につきまして、お支払いのご案内です。\n"
+        "※現地決済は不可となります。お支払い完了後はメールでご連絡ください。\n\n"
+        "■ PayPayでお支払いの場合\n"
+        "添付のQRコードよりお手続きください。\n"
+        + bettei_note
+    )
+    if furikomi_ok:
+        msg += (
+            "\n■ 銀行振込でお支払いの場合\n"
+            + ACO_BANK + "\n"
+            "※お振込手数料はお客様のご負担をお願いいたします。\n"
+        )
+    else:
+        msg += ("\n恐れ入りますが、ご宿泊日まで1週間を切っているため、"
+                "今回はPayPayでのお支払いのみとさせていただきます。\n")
+    msg += (
+        "\n【お支払い金額】\n"
         f"{amt}\n"
         "【お支払い期日】\n"
         f"{deadline_str}\n"
-        "何卒、よろしくお願いいたします。\n"
+        "ご不明点等ございましたらお気軽にご連絡ください。\n"
         "軽井沢ハウスヴィラ"
     )
-
-
-def furikomi_message(amount, deadline_str):
-    amt = f"{int(amount):,}円" if amount else "〇円"
-    return (
-        "下記に振込口座先を記載しておりますので期日までにお振込をお願い致します。\n"
-        + ACO_BANK + "\n"
-        "【金額】\n"
-        f"{amt}\n"
-        "※お振込手数料はご負担いただきますようお願いいたします。\n"
-        "【お支払い期日】\n"
-        f"{deadline_str}まで"
-    )
+    return msg
 
 
 # ============================================================
@@ -1263,42 +1262,49 @@ with tab_calc:
 # タブ: PayPay・振込
 # ------------------------------------------------------------
 with tab_pay:
-    st.subheader("PayPay・振込 クイック案内")
-    st.caption("棟を選ぶと該当QRと案内文が出ます。金額・期日を入れて文面をコピー、QRは"
-               "「コピー」ボタンでそのままメールに貼り付けできます。")
+    st.subheader("支払い案内（PayPay／振込）")
+    st.caption("項目・金額・宿泊日・期日を入れると、PayPayと振込をまとめた1通の案内文ができます。"
+               "振込はご宿泊日まで1週間以上ある場合のみ自動で含まれます。")
 
-    p1, p2, p3 = st.columns(3)
-    tou = p1.selectbox("棟（PayPay QR）", ["A棟", "B棟", "別邸"])
+    p1, p2 = st.columns(2)
+    tou = p1.selectbox("棟（別邸の注記用）", ["A棟", "B棟", "別邸"])
     opt_name = p2.text_input("項目名", value="ペットプラン",
                              help="例）ペットプラン、サウナ、人数追加 など")
+    p3, p4, p5 = st.columns(3)
     pay_amount = p3.number_input("金額（円）", min_value=0, step=1000, value=0)
-    pay_deadline = st.date_input("お支払い期日",
+    stay = p4.date_input("宿泊日",
+                         value=datetime.date.today() + datetime.timedelta(days=10))
+    pay_deadline = p5.date_input("お支払い期日",
                                  value=datetime.date.today() + datetime.timedelta(days=7))
-    deadline_str = jp_date(pay_deadline)
 
-    method = st.radio("支払い方法", ["PayPay", "銀行振込"], horizontal=True)
-
-    if method == "PayPay":
-        st.markdown("#### 案内文（コピー用）")
-        if tou == "別邸":
-            st.caption('別邸はA棟のQRで支払い後 "A棟" と表示されます（案内文に注記済み）。')
-        st.text_area("", value=paypay_message(tou, opt_name, pay_amount, deadline_str),
-                     height=300, label_visibility="collapsed")
-
-        st.markdown(f"#### QRコード（{tou}）")
-        qp = qr_path_for(tou)
-        if qp:
-            ic1, ic2 = st.columns([1, 2])
-            with ic1:
-                st.image(qp, caption=tou, width=220)
-            with ic2:
-                image_copy_button(file_b64(qp), mime=img_mime(qp))
-                st.download_button("QR画像をダウンロード", data=open(qp, "rb").read(),
-                                   file_name=os.path.basename(qp), mime=img_mime(qp))
-        else:
-            st.warning(f"{tou}のQR画像が見つかりません。`{PAYPAY_QR_FILES.get(tou, '')}` を"
-                       "お問い合わせbotフォルダ（または qr/ フォルダ）に置いてください。")
+    furikomi_ok = (stay - datetime.date.today()).days >= 7
+    if furikomi_ok:
+        st.info("ご宿泊日まで1週間以上 → PayPay・振込の両方を案内します。")
     else:
-        st.markdown("#### 振込案内（コピー用）")
-        st.text_area("", value=furikomi_message(pay_amount, deadline_str),
-                     height=320, label_visibility="collapsed")
+        st.warning("ご宿泊日まで1週間未満 → PayPayのみ案内します（振込不可）。")
+
+    st.markdown("#### 案内文（コピー用）")
+    st.text_area("", value=payment_message(tou, opt_name, pay_amount,
+                                           jp_date(pay_deadline), furikomi_ok),
+                 height=380, label_visibility="collapsed")
+
+    st.markdown("#### QRコード一覧（送る棟のQRをコピー／ダウンロード）")
+    ncol = min(4, len(PAYPAY_QR))
+    qcols = st.columns(ncol)
+    missing = []
+    for i, (label, fname) in enumerate(PAYPAY_QR):
+        with qcols[i % ncol]:
+            p = qr_path(fname)
+            if p:
+                st.image(p, caption=label, width=180)
+                image_copy_button(file_b64(p), mime=img_mime(p))
+                st.download_button("ダウンロード", data=open(p, "rb").read(),
+                                   file_name=os.path.basename(p), mime=img_mime(p),
+                                   key=f"qrdl_{i}")
+            else:
+                st.markdown(f"**{label}**")
+                st.caption("画像なし")
+                missing.append(f"{label}: {fname}")
+    if missing:
+        st.warning("見つからないQR画像があります（フォルダまたは qr/ に置いてください）:\n\n- "
+                   + "\n- ".join(missing))
