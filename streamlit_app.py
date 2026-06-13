@@ -691,19 +691,24 @@ def deadline_info(facility_key, stay_date):
 # ============================================================
 QR_DIR = os.path.join(os.path.dirname(__file__), "qr")
 
+# 棟 → QR画像ファイル名（ファイル名はそのままでOK）
+PAYPAY_QR_FILES = {
+    "A棟":  "スクリーンショット 2026-05-02 112929.png",
+    "B棟":  "スクリーンショット 2026-05-02 112947.png",
+    "別邸": "スクリーンショット 2026-05-02 112905.png",
+}
 
-def list_qr_images():
-    """QR画像のパス一覧。qr/ フォルダがあればそこ、無ければ本体と同じフォルダの画像。
-    ファイル名は自由（QRに棟名が入っている前提で、見て選ぶ）。"""
-    base = QR_DIR if os.path.isdir(QR_DIR) else os.path.dirname(__file__)
-    out = []
-    try:
-        for fn in sorted(os.listdir(base)):
-            if fn.lower().endswith((".png", ".jpg", ".jpeg")):
-                out.append(os.path.join(base, fn))
-    except Exception:
-        pass
-    return out
+
+def qr_path_for(tou):
+    """棟に対応するQR画像のパスを返す。qr/ フォルダ→本体フォルダの順で探す。無ければNone。"""
+    fname = PAYPAY_QR_FILES.get(tou)
+    if not fname:
+        return None
+    for base in (QR_DIR, os.path.dirname(__file__)):
+        p = os.path.join(base, fname)
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def img_mime(path):
@@ -1259,11 +1264,11 @@ with tab_calc:
 # ------------------------------------------------------------
 with tab_pay:
     st.subheader("PayPay・振込 クイック案内")
-    st.caption("金額・期日を入れて案内文をコピー。QRは下に全棟分を表示するので、"
-               "送りたい棟のQRを「コピー」または「ダウンロード」でメールに貼り付けてください。")
+    st.caption("棟を選ぶと該当QRと案内文が出ます。金額・期日を入れて文面をコピー、QRは"
+               "「コピー」ボタンでそのままメールに貼り付けできます。")
 
     p1, p2, p3 = st.columns(3)
-    tou = p1.selectbox("棟（案内文の注記用）", ["A棟", "B棟", "別邸"])
+    tou = p1.selectbox("棟（PayPay QR）", ["A棟", "B棟", "別邸"])
     opt_name = p2.text_input("項目名", value="ペットプラン",
                              help="例）ペットプラン、サウナ、人数追加 など")
     pay_amount = p3.number_input("金額（円）", min_value=0, step=1000, value=0)
@@ -1280,21 +1285,19 @@ with tab_pay:
         st.text_area("", value=paypay_message(tou, opt_name, pay_amount, deadline_str),
                      height=300, label_visibility="collapsed")
 
-        st.markdown("#### QRコード（棟名はQR画像に記載）")
-        qrs = list_qr_images()
-        if not qrs:
-            st.warning("QR画像が見つかりません。お問い合わせbotフォルダ（または中に作った "
-                       "`qr` フォルダ）にQR画像（png/jpg）を置いてください。ファイル名は自由です。")
+        st.markdown(f"#### QRコード（{tou}）")
+        qp = qr_path_for(tou)
+        if qp:
+            ic1, ic2 = st.columns([1, 2])
+            with ic1:
+                st.image(qp, caption=tou, width=220)
+            with ic2:
+                image_copy_button(file_b64(qp), mime=img_mime(qp))
+                st.download_button("QR画像をダウンロード", data=open(qp, "rb").read(),
+                                   file_name=os.path.basename(qp), mime=img_mime(qp))
         else:
-            ncol = min(3, len(qrs))
-            cols = st.columns(ncol)
-            for i, p in enumerate(qrs):
-                with cols[i % ncol]:
-                    st.image(p, caption=os.path.basename(p), width=210)
-                    image_copy_button(file_b64(p), mime=img_mime(p))
-                    st.download_button("ダウンロード", data=open(p, "rb").read(),
-                                       file_name=os.path.basename(p), mime=img_mime(p),
-                                       key=f"qrdl_{i}")
+            st.warning(f"{tou}のQR画像が見つかりません。`{PAYPAY_QR_FILES.get(tou, '')}` を"
+                       "お問い合わせbotフォルダ（または qr/ フォルダ）に置いてください。")
     else:
         st.markdown("#### 振込案内（コピー用）")
         st.text_area("", value=furikomi_message(pay_amount, deadline_str),
